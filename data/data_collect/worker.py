@@ -6,6 +6,8 @@ class Worker:
     def __init__(self, collector):
         self.collector = collector
         self._data = []
+        self.init_date = 2020
+        self.end_date = 2027
 
     def save_to_file(self, filename):
         path = os.path.join("C:\\Users\\bilol\\Documents\\Projects\\TCC\\data", "raw_data", "pni", filename)
@@ -17,13 +19,21 @@ class Worker:
         self._data = []
 
     def run(self):
-            print("Starting data collection...")
+            date = self.init_date
+            uf_estabelecimentos = ["SP", "BA"]
             offset = 0
-            
-            date = 2024
-            uf_estabelecimento = "SP"
+
+            print(f"Starting data collection on state {uf_estabelecimentos[0]} for year {date}...")            
+
             while True:
-                if date == 2027:
+                uf_estabelecimento = uf_estabelecimentos[0]  # Seleciona o primeiro estado da lista
+                if date == self.end_date:
+                    uf_estabelecimentos.pop(0)
+                    print(f"Restarting data collection to state {uf_estabelecimentos[0]} for year {date}...")
+                    date = self.init_date
+
+                if not uf_estabelecimentos:
+                    print("Data collection completed for all states.")
                     break
 
                 response = self.collector.collect_data(offset=offset, year=int(date), uf_estabelecimento=uf_estabelecimento)
@@ -48,12 +58,12 @@ class Worker:
                 
                 if offset % 100000 == 0 and offset != 0:
                     print("saving data to file...")
-                    self.save_to_file(f"{date}/data_{offset}.json")  # salva uma única vez no final
+                    self.save_to_file(f"{uf_estabelecimento}/{date}/data_{offset}.json")  # salva uma única vez no final
                     self.clean_data()  # limpa os dados para a próxima rodada
                 
                 offset += self.collector.limit
     
-            self.save_to_file(f"{date}/data_{offset}.json")  # salva uma única vez no final
+            self.save_to_file(f"{uf_estabelecimento}/{date}/data_{offset}.json")  # salva uma única vez no final
             print(f"Total de páginas: {offset // self.collector.limit}, total de registros: {len(self._data)}")
             print("End of data collection.")
             
