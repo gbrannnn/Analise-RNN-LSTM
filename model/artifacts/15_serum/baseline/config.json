@@ -1,0 +1,17 @@
+{
+  "window": 4,
+  "val_months": 2,
+  "test_months": 2,
+  "noise_level": 0.0,
+  "missing_ratio": 0.0,
+  "n_layers": 1,
+  "units": 64,
+  "dropout": 0.0,
+  "recurrent_dropout": 0.0,
+  "dense_units": 32,
+  "learning_rate": 0.001,
+  "epochs": 10,
+  "batch_size": 32,
+  "seasonal_m": 12,
+  "seed": 42
+}
