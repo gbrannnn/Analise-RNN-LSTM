@@ -45,8 +45,8 @@ SEEDS = [42, 7, 123, 2024, 31337]
 # as rodadas de baseline já cobrem esse ponto de cada curva.
 FACTORS = {
     "entrada": {
-        # Com séries de 12 meses, val=2 e teste=2, a janela máxima é 7.
-        "window": [2, 3, 6],
+        # Com séries de 32 meses, val=4 e teste=4, a janela máxima é 23.
+        "window": [3, 6, 9, 18],
         "noise_level": [0.05, 0.1, 0.2, 0.3],
         "missing_ratio": [0.1, 0.2, 0.3],
     },

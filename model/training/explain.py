@@ -1,7 +1,7 @@
 """
 Explicabilidade (SHAP e LIME) do modelo baseline já treinado de cada vacina.
 
-Cada mês da janela de entrada é tratado como uma feature tabular ("t-4" ... "t-1",
+Cada mês da janela de entrada é tratado como uma feature tabular ("t-12" ... "t-1",
 onde t-1 é o mês imediatamente anterior ao previsto). As importâncias saem na
 escala normalizada do modelo, que é comum a todos os municípios.
 

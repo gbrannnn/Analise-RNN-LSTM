@@ -31,7 +31,7 @@ from series import (
 from metrics import append_results, forecast_metrics
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PREPARED_DATA_DIR = os.path.join(BASE_DIR, "..", "..", "data", "prepared_data", "pni")
+PREPARED_DATA_DIR = os.path.join(BASE_DIR, "..", "..", "data", "prepared_data", "pni", "SP")
 ARTIFACTS_DIR = os.path.join(BASE_DIR, "..", "artifacts")
 RESULTS_PATH = os.path.join(ARTIFACTS_DIR, "resultados.csv")
 
@@ -46,11 +46,13 @@ tf.config.experimental.enable_op_determinism()
 @dataclass(frozen=True)
 class ExperimentConfig:
     # Parâmetros de entrada.
-    # Com 12 meses por série sobra pouca folga para a janela; ao regerar o
-    # prepared_data com o range completo, vale subir para 12 (sazonalidade anual).
-    window: int = 4
-    val_months: int = 2
-    test_months: int = 2
+    # Séries de 2024-01 a 2026-08 (32 meses): janela de 12 cobre a sazonalidade
+    # anual e deixa treino prevendo 2025, validação 2026-01..04 e teste 2026-05..08.
+    # Séries com menos de window + val + test + 1 meses (ex.: pastas antigas de 2020)
+    # ficam de fora do treino.
+    window: int = 12
+    val_months: int = 4
+    test_months: int = 4
     noise_level: float = 0.0
     missing_ratio: float = 0.0
     # Hiperparâmetros estruturais
