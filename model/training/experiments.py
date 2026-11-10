@@ -11,6 +11,10 @@ Exemplos:
     python experiments.py --vacinas 9_serum --fatores dropout units
     python experiments.py --apenas-baseline --seeds 42 7 123
     python experiments.py --apenas-resumo              # só regera tabelas/gráficos
+    python experiments.py --dados exogenas             # mesmo fluxo com covariáveis
+
+Com --dados exogenas, o registro é artifacts/resultados_exogenas.csv e o resumo vai
+para artifacts/sensibilidade_exogenas/.
 """
 import os
 import argparse
@@ -24,18 +28,24 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from series import find_vaccine_dirs, load_vaccine_series
+from series import find_vaccine_dirs
 from metrics import append_results
 from lstm import (
     ARTIFACTS_DIR,
-    PREPARED_DATA_DIR,
-    RESULTS_PATH,
+    DATASETS,
+    DEFAULT_DATASET,
     ExperimentConfig,
+    add_dataset_arg,
     baseline_dir,
+    load_dataset,
     run_experiment,
 )
 
 SUMMARY_DIR = os.path.join(ARTIFACTS_DIR, "sensibilidade")
+SUMMARY_DIRS = {
+    "pni": SUMMARY_DIR,
+    "exogenas": os.path.join(ARTIFACTS_DIR, "sensibilidade_exogenas"),
+}
 
 BASELINE = ExperimentConfig()
 
@@ -87,25 +97,26 @@ def planned_runs(baseline, fatores, seeds):
     return runs
 
 
-def run_all(baseline, vacinas, fatores, seeds):
+def run_all(baseline, vacinas, fatores, seeds, dados=DEFAULT_DATASET):
     execucao = datetime.now().strftime("%Y%m%d-%H%M%S")
     runs = planned_runs(baseline, fatores, seeds)
+    dataset = DATASETS[dados]
 
-    for vaccine_dir in find_vaccine_dirs(PREPARED_DATA_DIR):
+    for vaccine_dir in find_vaccine_dirs(dataset["prepared_dir"]):
         nome_vacina = os.path.basename(vaccine_dir)
         if vacinas and nome_vacina not in vacinas:
             continue
 
-        print(f"\n=== vacina {nome_vacina}: {len(runs)} treinos ===")
-        clean_series = load_vaccine_series(vaccine_dir)
+        print(f"\n=== vacina {nome_vacina} ({dados}): {len(runs)} treinos ===")
+        clean_series, covariates = load_dataset(vaccine_dir, dados)
 
         for i, (grupo, fator, valor, config) in enumerate(runs, start=1):
             label = "baseline" if fator == "baseline" else f"{fator}={valor}"
             print(f"[{i}/{len(runs)}] {label} seed={config.seed}")
 
             # O modelo baseline da primeira seed é o que explain.py analisa.
-            save_dir = baseline_dir(nome_vacina) if fator == "baseline" and config.seed == seeds[0] else None
-            row = run_experiment(nome_vacina, clean_series, config, save_dir=save_dir)
+            save_dir = baseline_dir(nome_vacina, dados) if fator == "baseline" and config.seed == seeds[0] else None
+            row = run_experiment(nome_vacina, clean_series, config, save_dir=save_dir, covariates_by_municipio=covariates)
             if row is None:
                 continue
 
@@ -118,7 +129,7 @@ def run_all(baseline, vacinas, fatores, seeds):
             )
             print(f"    MAE={row['mae']:.2f} RMSE={row['rmse']:.2f} MAPE={row['mape']:.2f}% MASE={row['mase']:.3f}")
             # Grava a cada treino para não perder o que já rodou se o processo for interrompido.
-            append_results([row], RESULTS_PATH)
+            append_results([row], dataset["results_path"])
 
 
 def matches_baseline(row, baseline):
@@ -132,35 +143,37 @@ def matches_baseline(row, baseline):
     return True
 
 
-def load_registry(baseline):
+def load_registry(baseline, results_path):
     """
     Lê o registro acumulativo e mantém só as rodadas comparáveis ao baseline atual.
 
     Rodadas feitas com outro baseline (ex.: antes de mudar epochs) ficam de fora, e
     se a mesma configuração+seed foi rodada mais de uma vez vale a mais recente.
     """
-    df = pd.read_csv(RESULTS_PATH)
+    df = pd.read_csv(results_path)
     df = df[df.apply(matches_baseline, axis=1, baseline=baseline)]
     return df.drop_duplicates(subset=["vacina", "fator", "valor", "seed"], keep="last")
 
 
-def summarize(baseline):
-    if not os.path.exists(RESULTS_PATH):
-        print(f"registro {RESULTS_PATH} não existe, nada para consolidar.")
+def summarize(baseline, dados=DEFAULT_DATASET):
+    results_path = DATASETS[dados]["results_path"]
+    summary_dir = SUMMARY_DIRS[dados]
+    if not os.path.exists(results_path):
+        print(f"registro {results_path} não existe, nada para consolidar.")
         return
 
-    df = load_registry(baseline)
+    df = load_registry(baseline, results_path)
     if df.empty:
         print("nenhuma rodada compatível com o baseline atual no registro.")
         return
 
-    os.makedirs(SUMMARY_DIR, exist_ok=True)
+    os.makedirs(summary_dir, exist_ok=True)
     base_rows = df[df["fator"] == "baseline"]
     agg = {f"{m}_{s}": (m, s) for m in METRICS for s in ("mean", "std")}
 
     base_stats = base_rows.groupby("vacina").agg(n_seeds=("seed", "nunique"), **agg)
     base_stats["baseline_aceito"] = base_stats["mase_mean"] < 1
-    base_stats.to_csv(os.path.join(SUMMARY_DIR, "baseline_validacao.csv"))
+    base_stats.to_csv(os.path.join(summary_dir, "baseline_validacao.csv"))
     print("\nvalidação do baseline (aceito se MASE médio < 1):")
     print(base_stats[["n_seeds", "mase_mean", "mase_std", "mae_mean", "mape_mean", "baseline_aceito"]].to_string())
 
@@ -191,15 +204,15 @@ def summarize(baseline):
         summary[f"delta_{m}_pct"] = summary[f"delta_{m}"] / base_mean * 100
         summary[f"{m}_supera_ruido_seed"] = summary[f"delta_{m}"].abs() > NOISE_MULTIPLIER * base_std
 
-    summary_path = os.path.join(SUMMARY_DIR, "resumo_sensibilidade.csv")
+    summary_path = os.path.join(summary_dir, "resumo_sensibilidade.csv")
     summary.to_csv(summary_path, index=False)
     print(f"\nresumo salvo em {summary_path}")
 
     for fator, data in summary.groupby("fator"):
-        plot_factor(fator, data, baseline)
+        plot_factor(fator, data, baseline, summary_dir)
 
 
-def plot_factor(fator, data, baseline):
+def plot_factor(fator, data, baseline, summary_dir=SUMMARY_DIR):
     fig, axes = plt.subplots(1, len(METRICS), figsize=(4.2 * len(METRICS), 3.6))
 
     for ax, metric in zip(axes, METRICS):
@@ -225,7 +238,7 @@ def plot_factor(fator, data, baseline):
     axes[0].legend(fontsize=8)
     fig.suptitle(f"Sensibilidade a {fator} (média ± desvio entre seeds; pontilhado = baseline)")
     fig.tight_layout()
-    path = os.path.join(SUMMARY_DIR, f"sensibilidade_{fator}.png")
+    path = os.path.join(summary_dir, f"sensibilidade_{fator}.png")
     fig.savefig(path, dpi=120)
     plt.close(fig)
 
@@ -239,6 +252,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, help="sobrescreve epochs do baseline (útil para testes rápidos)")
     parser.add_argument("--apenas-baseline", action="store_true", help="roda só o baseline em todas as seeds")
     parser.add_argument("--apenas-resumo", action="store_true", help="não treina, só consolida o registro")
+    add_dataset_arg(parser)
     return parser.parse_args()
 
 
@@ -248,6 +262,6 @@ if __name__ == "__main__":
 
     if not args.apenas_resumo:
         fatores = [] if args.apenas_baseline else args.fatores
-        run_all(baseline, args.vacinas, fatores, args.seeds)
+        run_all(baseline, args.vacinas, fatores, args.seeds, args.dados)
 
-    summarize(baseline)
+    summarize(baseline, args.dados)

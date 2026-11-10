@@ -3,6 +3,27 @@ import os
 import numpy as np
 import pandas as pd
 
+# Covariáveis do conjunto pni_exogenas (data/data_preparing/main.py) usadas como
+# features extras em cada mês da janela. As proporções e a flag já estão em [0, 1];
+# idade_media vai para escala parecida com divisão fixa, sem estatística dos dados.
+COVARIATE_COLUMNS = [
+    "idade_media",
+    "pct_idade_0_1",
+    "pct_idade_2_4",
+    "pct_idade_5_19",
+    "pct_idade_20_59",
+    "pct_idade_60_mais",
+    "pct_estabelecimento_publico",
+    "pct_natureza_desconhecida",
+    "mes_sem_aplicacao",
+]
+COVARIATE_SCALE = {"idade_media": 100.0}
+
+
+def input_feature_names(with_covariates):
+    """Nome das features de cada passo da janela, na ordem do último eixo de X."""
+    return ["doses_aplicadas"] + (COVARIATE_COLUMNS if with_covariates else [])
+
 
 def find_vaccine_dirs(prepared_dir):
     if not os.path.isdir(prepared_dir):
@@ -41,6 +62,43 @@ def load_vaccine_series(vaccine_dir):
         series_by_municipio[os.path.splitext(filename)[0]] = series
 
     return series_by_municipio
+
+
+def load_vaccine_covariates(vaccine_dir, series_by_municipio):
+    """
+    Covariáveis já escaladas (município -> DataFrame mês x COVARIATE_COLUMNS) das
+    séries carregadas por load_vaccine_series, com o mesmo índice de meses.
+    """
+    covariates_by_municipio = {}
+
+    for codigo_municipio, series in series_by_municipio.items():
+        path = os.path.join(vaccine_dir, f"{codigo_municipio}.csv")
+        df = pd.read_csv(path, parse_dates=["mes"]).set_index("mes").sort_index()
+
+        missing = [c for c in COVARIATE_COLUMNS if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"{path} não tem as covariáveis {missing}. "
+                "Use o conjunto pni_exogenas gerado por data/data_preparing/main.py."
+            )
+
+        covariates = df[COVARIATE_COLUMNS].astype("float64").reindex(series.index)
+        for column, divisor in COVARIATE_SCALE.items():
+            covariates[column] = covariates[column] / divisor
+        covariates_by_municipio[codigo_municipio] = covariates
+
+    return covariates_by_municipio
+
+
+def model_inputs(scaled_values, covariates=None):
+    """
+    Matriz (meses x features) que alimenta a janela: doses escaladas na 1ª coluna e,
+    se houver, as covariáveis do mesmo mês nas seguintes.
+    """
+    columns = [np.asarray(scaled_values).reshape(-1, 1)]
+    if covariates is not None:
+        columns.append(covariates.to_numpy())
+    return np.hstack(columns)
 
 
 def train_end_index(n, val_months, test_months):
@@ -114,7 +172,7 @@ def unscale(scaled_values, mean, std):
     return np.clip(doses, 0.0, None)
 
 
-def build_supervised_dataset(series_by_municipio, window, val_months, test_months):
+def build_supervised_dataset(series_by_municipio, window, val_months, test_months, covariates_by_municipio=None):
     """
     Monta as janelas (X, y) de todas as séries de uma vacina em um único dataset.
 
@@ -123,11 +181,15 @@ def build_supervised_dataset(series_by_municipio, window, val_months, test_month
     incluir meses de treino — o que nunca acontece é o alvo de um mês de teste
     influenciar o ajuste dos pesos ou as estatísticas de normalização.
 
+    Com `covariates_by_municipio`, cada passo da janela também traz as covariáveis
+    daquele mês (t-window .. t-1); as do mês previsto t nunca entram.
+
     `meta[split]` guarda (município, mês alvo) de cada amostra, na mesma ordem de X.
     """
     splits = {name: {"X": [], "y": [], "meta": []} for name in ("train", "val", "test")}
     scalers = {}
     skipped = []
+    n_features = len(input_feature_names(covariates_by_municipio is not None))
 
     min_months = window + val_months + test_months + 1
 
@@ -143,6 +205,8 @@ def build_supervised_dataset(series_by_municipio, window, val_months, test_month
         mean, std = fit_scaler(values[:train_end])
         scaled = scale(values, mean, std)
         scalers[codigo_municipio] = (mean, std)
+        covariates = covariates_by_municipio[codigo_municipio] if covariates_by_municipio is not None else None
+        inputs = model_inputs(scaled, covariates)
 
         for t in range(window, n):
             if t < train_end:
@@ -152,7 +216,7 @@ def build_supervised_dataset(series_by_municipio, window, val_months, test_month
             else:
                 split = "test"
 
-            splits[split]["X"].append(scaled[t - window:t])
+            splits[split]["X"].append(inputs[t - window:t])
             splits[split]["y"].append(scaled[t])
             splits[split]["meta"].append((codigo_municipio, series.index[t]))
 
@@ -160,9 +224,9 @@ def build_supervised_dataset(series_by_municipio, window, val_months, test_month
     for split, data in splits.items():
         meta[split] = data["meta"]
         if not data["X"]:
-            datasets[split] = (np.empty((0, window, 1), dtype="float32"), np.empty((0,), dtype="float32"))
+            datasets[split] = (np.empty((0, window, n_features), dtype="float32"), np.empty((0,), dtype="float32"))
             continue
-        X = np.asarray(data["X"], dtype="float32").reshape(-1, window, 1)
+        X = np.asarray(data["X"], dtype="float32").reshape(-1, window, n_features)
         y = np.asarray(data["y"], dtype="float32")
         datasets[split] = (X, y)
 

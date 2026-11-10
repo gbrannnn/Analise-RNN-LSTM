@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime
 
@@ -22,7 +23,10 @@ from tensorflow.keras.utils import set_random_seed
 from series import (
     build_supervised_dataset,
     find_vaccine_dirs,
+    input_feature_names,
+    load_vaccine_covariates,
     load_vaccine_series,
+    model_inputs,
     perturb_series,
     scale,
     train_end_index,
@@ -34,6 +38,25 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PREPARED_DATA_DIR = os.path.join(BASE_DIR, "..", "..", "data", "prepared_data", "pni", "SP")
 ARTIFACTS_DIR = os.path.join(BASE_DIR, "..", "artifacts")
 RESULTS_PATH = os.path.join(ARTIFACTS_DIR, "resultados.csv")
+
+# Conjuntos de dados de entrada. "pni" é o baseline de série única (só doses);
+# "exogenas" acrescenta as covariáveis de cada mês da janela. Cada um tem sua pasta
+# de dados, seu registro de resultados e sua subpasta de artefatos por vacina.
+DATASETS = {
+    "pni": {
+        "prepared_dir": PREPARED_DATA_DIR,
+        "results_path": RESULTS_PATH,
+        "artifact_subdir": "baseline",
+        "covariates": False,
+    },
+    "exogenas": {
+        "prepared_dir": os.path.join(BASE_DIR, "..", "..", "data", "prepared_data", "pni_exogenas", "SP"),
+        "results_path": os.path.join(ARTIFACTS_DIR, "resultados_exogenas.csv"),
+        "artifact_subdir": "exogenas",
+        "covariates": True,
+    },
+}
+DEFAULT_DATASET = "pni"
 
 # Quantas séries plotar por vacina (as de maior volume de doses).
 PLOT_TOP_N = 3
@@ -74,8 +97,8 @@ class ExperimentConfig:
         return cls(**{k: v for k, v in data.items() if k in names})
 
 
-def build_model(config):
-    layers = [InputLayer(shape=(config.window, 1))]
+def build_model(config, n_features=1):
+    layers = [InputLayer(shape=(config.window, n_features))]
     for i in range(config.n_layers):
         layers.append(
             LSTM(
@@ -120,7 +143,7 @@ class RestoreBestWeights(Callback):
             self.model.set_weights(self.best_weights)
 
 
-def predict_series(model, series, scaler, window):
+def predict_series(model, series, scaler, window, covariates=None):
     """
     Previsão de 1 mês à frente para todos os meses previsíveis de uma série.
 
@@ -128,16 +151,16 @@ def predict_series(model, series, scaler, window):
     realimenta a saída do modelo), então o erro não se acumula.
     """
     mean, std = scaler
-    scaled = scale(series.to_numpy(), mean, std)
+    inputs = model_inputs(scale(series.to_numpy(), mean, std), covariates)
     windows = np.asarray(
-        [scaled[t - window:t] for t in range(window, len(scaled))], dtype="float32"
-    ).reshape(-1, window, 1)
+        [inputs[t - window:t] for t in range(window, len(inputs))], dtype="float32"
+    ).reshape(-1, window, inputs.shape[1])
 
     predicted_scaled = model.predict(windows, verbose=0).reshape(-1)
     return series.index[window:], unscale(predicted_scaled, mean, std)
 
 
-def evaluate_forecast(model, clean_series, model_series, scalers, config):
+def evaluate_forecast(model, clean_series, model_series, scalers, config, covariates_by_municipio=None):
     """
     Métricas em doses sobre os meses de teste de todas as séries.
 
@@ -146,17 +169,19 @@ def evaluate_forecast(model, clean_series, model_series, scalers, config):
     """
     codigos = [c for c in scalers if c in clean_series]
     windows, owners = [], []
+    n_features = len(input_feature_names(covariates_by_municipio is not None))
 
     for codigo in codigos:
         mean, std = scalers[codigo]
-        scaled = scale(model_series[codigo].to_numpy(), mean, std)
-        n = len(scaled)
+        covariates = covariates_by_municipio[codigo] if covariates_by_municipio is not None else None
+        inputs = model_inputs(scale(model_series[codigo].to_numpy(), mean, std), covariates)
+        n = len(inputs)
         for t in range(n - config.test_months, n):
-            windows.append(scaled[t - config.window:t])
+            windows.append(inputs[t - config.window:t])
             owners.append(codigo)
 
     predicted_scaled = model.predict(
-        np.asarray(windows, dtype="float32").reshape(-1, config.window, 1), verbose=0
+        np.asarray(windows, dtype="float32").reshape(-1, config.window, n_features), verbose=0
     ).reshape(-1)
 
     per_series = []
@@ -172,7 +197,9 @@ def evaluate_forecast(model, clean_series, model_series, scalers, config):
     return forecast_metrics(per_series, config.seasonal_m)
 
 
-def plot_predictions(model, clean_series, model_series, scalers, config, output_path, titulo):
+def plot_predictions(
+    model, clean_series, model_series, scalers, config, output_path, titulo, covariates_by_municipio=None
+):
     plotaveis = [c for c in scalers if c in clean_series]
     top = sorted(plotaveis, key=lambda c: clean_series[c].sum(), reverse=True)[:PLOT_TOP_N]
     if not top:
@@ -183,7 +210,8 @@ def plot_predictions(model, clean_series, model_series, scalers, config, output_
 
     for ax, codigo in zip(axes, top):
         real = clean_series[codigo]
-        dates, predicted = predict_series(model, model_series[codigo], scalers[codigo], config.window)
+        covariates = covariates_by_municipio[codigo] if covariates_by_municipio is not None else None
+        dates, predicted = predict_series(model, model_series[codigo], scalers[codigo], config.window, covariates)
 
         ax.plot(real.index, real.to_numpy(), label="real", color="#1f77b4", marker="o", ms=3)
         ax.plot(dates, predicted, label="previsto", color="#d62728", ls="--", marker="x", ms=4)
@@ -204,12 +232,15 @@ def plot_predictions(model, clean_series, model_series, scalers, config, output_
     return output_path
 
 
-def run_experiment(nome_vacina, clean_series, config, save_dir=None, verbose=0):
+def run_experiment(nome_vacina, clean_series, config, save_dir=None, verbose=0, covariates_by_municipio=None):
     """
     Treina e avalia um modelo para uma vacina com uma configuração.
 
     Retorna a linha de resultado (config + métricas) ou None se não houver dados
     suficientes. Com `save_dir`, salva modelo, config e gráfico de previsões.
+
+    Com `covariates_by_municipio`, as covariáveis entram como features extras da
+    janela. Ruído e meses faltantes (noise_level, missing_ratio) só atingem as doses.
     """
     set_random_seed(config.seed)
 
@@ -222,7 +253,7 @@ def run_experiment(nome_vacina, clean_series, config, save_dir=None, verbose=0):
         config.seed,
     )
     datasets, scalers, skipped, _ = build_supervised_dataset(
-        model_series, config.window, config.val_months, config.test_months
+        model_series, config.window, config.val_months, config.test_months, covariates_by_municipio
     )
     X_train, y_train = datasets["train"]
     X_val, y_val = datasets["val"]
@@ -233,7 +264,7 @@ def run_experiment(nome_vacina, clean_series, config, save_dir=None, verbose=0):
         print(f"  dados insuficientes ({len(skipped)} séries com menos de {min_months} meses), pulando.")
         return None
 
-    model = build_model(config)
+    model = build_model(config, n_features=X_train.shape[2])
     best = RestoreBestWeights()
     model.fit(
         X_train,
@@ -255,7 +286,7 @@ def run_experiment(nome_vacina, clean_series, config, save_dir=None, verbose=0):
         "n_train": len(X_train),
         "best_epoch": best.best_epoch,
         "val_rmse_escalado": float(val_rmse),
-        **evaluate_forecast(model, clean_series, model_series, scalers, config),
+        **evaluate_forecast(model, clean_series, model_series, scalers, config, covariates_by_municipio),
     }
 
     if save_dir:
@@ -271,6 +302,7 @@ def run_experiment(nome_vacina, clean_series, config, save_dir=None, verbose=0):
             config,
             os.path.join(save_dir, "previsoes.png"),
             f"Doses aplicadas - real x previsto ({nome_vacina})",
+            covariates_by_municipio,
         )
 
     return row
@@ -282,23 +314,45 @@ def load_saved_model(save_dir):
     return load_model(os.path.join(save_dir, "modelo.keras")), config
 
 
-def baseline_dir(nome_vacina):
-    return os.path.join(ARTIFACTS_DIR, nome_vacina, "baseline")
+def baseline_dir(nome_vacina, dados=DEFAULT_DATASET):
+    return os.path.join(ARTIFACTS_DIR, nome_vacina, DATASETS[dados]["artifact_subdir"])
+
+
+def load_dataset(vaccine_dir, dados):
+    """Séries de doses e, no conjunto com covariáveis, as covariáveis (None no baseline)."""
+    clean_series = load_vaccine_series(vaccine_dir)
+    covariates = load_vaccine_covariates(vaccine_dir, clean_series) if DATASETS[dados]["covariates"] else None
+    return clean_series, covariates
+
+
+def add_dataset_arg(parser):
+    parser.add_argument(
+        "--dados", choices=sorted(DATASETS), default=DEFAULT_DATASET,
+        help="conjunto de entrada: 'pni' (baseline, só doses) ou 'exogenas' (doses + covariáveis)",
+    )
 
 
 if __name__ == "__main__":
     # Treino único do baseline por vacina. Para várias seeds e a análise de
     # sensibilidade, use experiments.py.
+    parser = argparse.ArgumentParser(description="Treino único por vacina.")
+    add_dataset_arg(parser)
+    dados = parser.parse_args().dados
+    dataset = DATASETS[dados]
+
     config = ExperimentConfig()
     execucao = datetime.now().strftime("%Y%m%d-%H%M%S")
     rows = []
 
-    for vaccine_dir in find_vaccine_dirs(PREPARED_DATA_DIR):
+    for vaccine_dir in find_vaccine_dirs(dataset["prepared_dir"]):
         nome_vacina = os.path.basename(vaccine_dir)
-        print(f"\n=== vacina {nome_vacina} ===")
-        clean_series = load_vaccine_series(vaccine_dir)
+        print(f"\n=== vacina {nome_vacina} ({dados}) ===")
+        clean_series, covariates = load_dataset(vaccine_dir, dados)
 
-        row = run_experiment(nome_vacina, clean_series, config, save_dir=baseline_dir(nome_vacina), verbose=2)
+        row = run_experiment(
+            nome_vacina, clean_series, config, save_dir=baseline_dir(nome_vacina, dados), verbose=2,
+            covariates_by_municipio=covariates,
+        )
         if row is None:
             continue
 
@@ -315,7 +369,7 @@ if __name__ == "__main__":
         )
         rows.append(row)
 
-    append_results(rows, RESULTS_PATH)
+    append_results(rows, dataset["results_path"])
     if rows:
-        print(f"\nresultados acrescentados em {RESULTS_PATH}")
+        print(f"\nresultados acrescentados em {dataset['results_path']}")
         print(pd.DataFrame(rows)[["vacina", "n_test", "mae", "rmse", "mape", "mase", "mase_m"]].to_string(index=False))

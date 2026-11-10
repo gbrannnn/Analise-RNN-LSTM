@@ -90,3 +90,5 @@ Thumbs.db
 **/pni/
 
 .claude/
+
+*.md
